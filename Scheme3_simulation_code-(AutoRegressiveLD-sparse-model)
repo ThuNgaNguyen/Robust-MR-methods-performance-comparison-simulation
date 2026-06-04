@@ -1,0 +1,775 @@
+if (requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+  RhpcBLASctl::blas_set_num_threads(1L)
+  RhpcBLASctl::omp_set_num_threads(1L)
+} else {
+  Sys.setenv(
+    OMP_NUM_THREADS        = "1",
+    OPENBLAS_NUM_THREADS   = "1",
+    MKL_NUM_THREADS        = "1",
+    BLIS_NUM_THREADS       = "1",
+    VECLIB_MAXIMUM_THREADS = "1"
+  )
+}
+
+## ------------------- Package loading ------------------
+rm(list=ls())
+
+library(data.table)
+library(MendelianRandomization)
+library(dplyr)
+library(parallel)
+library(Matrix)
+library(MASS)
+
+outdir <- " "
+
+n_exp  <- c(400, 30000) #exposure sample size
+n_out         <- 90000  #outcome sample size
+J <- 3327  #number of instruments
+exp_h2   <- 0.1 #exposure heritability
+gamma  <- c(0.0, 0.2, 0.1) #causal effect estimate
+out_h2 <- c(0, 0.001, 0.01) #outcome heritabilities
+rho_values    <- 0.9
+n_causal <- c(1,10,25) #number of causal snps
+ld_pairs <- list(
+  list(ld_min = 0.10, ld_max = 0.95),
+  list(ld_min = 0.01, ld_max = 0.95),
+  list(ld_min = 0.00, ld_max = 1.00)
+) #LD correlation between causal SNPS
+
+param_list <- list()
+i <- 1
+
+for (n_exp_i in n_exp)
+  for (gamma_i in gamma)
+    for (out_h2_i in out_h2)
+      for (n_causal_i in n_causal)
+        for (ld in ld_pairs) {
+          param_list[[i]] <- data.frame(
+            n_exp    = n_exp_i,
+            gamma    = gamma_i,
+            out_h2   = out_h2_i,
+            rho      = 0.9,
+            n_causal = n_causal_i,
+            ld_min   = ld$ld_min,
+            ld_max   = ld$ld_max
+          )
+          i <- i + 1
+        }
+
+n_sim <- 1000L
+n_core <- 25L
+n_sim_per_core <- n_sim/n_core
+
+base_seed <- 20250119L
+
+RNGkind("L'Ecuyer-CMRG")
+set.seed(base_seed)
+
+worker_streams <- vector("list", n_core)
+worker_streams[[1]] <- .Random.seed
+for (i in 2:n_core)
+  worker_streams[[i]] <- parallel::nextRNGStream(worker_streams[[i - 1]])
+
+#162 configurations 
+########### Real LD from chrom2 (positions 102-103 Mb, GRCh37) ############
+Sigma_reg <- readRDS("~/Sigma_reg_chr2.rds")
+
+## ---------------- Load task parameters ------------
+task_id <- as.integer(Sys.getenv("SLURM_ARRAY_TASK_ID", "1"))
+stopifnot(task_id >= 1, task_id <= length(param_list))
+P <- param_list[[task_id]]
+P$combo_id <- task_id
+combo_id <- P$combo_id
+
+################## Define LDA.Egger, PCA-IVW, MR-link-2 code based on the source paper/code ################################
+# --- Define LDA.Egger ---
+LDA.MREgger <- function(X, Y, W) { #X-bx; Y-by; W-
+  bX   <- cbind(1, X)                       # Design matrix: intercept and exposure effects
+  bread <- solve(crossprod(bX, W) %*% bX)   # Inverse Fisher information matrix
+  theEsts <- bread %*% crossprod(bX, W %*% Y)  # Estimated intercept and slope
+  theresid <- c(Y - theEsts[1] - X * theEsts[2])  # Residuals
+  Sig.Est <- c(crossprod(theresid, W %*% theresid)) / (length(X) - 2)  # Residual variance
+  finresults <- cbind(theEsts, diag(bread) * Sig.Est)  # Estimates and their variances
+  TestStat <- theEsts / sqrt(finresults[,2])           # t-statistics
+  Pvals <- 2 * pt(abs(TestStat), df = nrow(bX) - 2, lower.tail = FALSE)
+  cbind(finresults, TestStat, Pvals)
+}
+
+# --- Define PCA-IVW ---
+pca_ivw <- function(bx, by, byse, rho, var_threshold = 0.99) {
+  Phi <- (bx / byse) %o% (bx / byse) * rho
+  pca_obj <- prcomp(Phi, scale = FALSE)
+  K <- which(cumsum(pca_obj$sdev^2 / sum(pca_obj$sdev^2)) > var_threshold)[1]
+  bx_pc <- as.numeric(bx %*% pca_obj$rotation[, 1:K])
+  by_pc <- as.numeric(by %*% pca_obj$rotation[, 1:K])
+  Omega <- (byse %o% byse) * rho
+  pcOmega <- t(pca_obj$rotation[, 1:K]) %*% Omega %*% pca_obj$rotation[, 1:K]
+  inv_pcOmega <- tryCatch(solve(pcOmega), error = function(e) MASS::ginv(pcOmega))
+  inter <- solve(t(bx_pc) %*% inv_pcOmega %*% bx_pc)
+  beta <- inter * t(bx_pc) %*% inv_pcOmega %*% by_pc
+  se_beta <- sqrt(inter)
+  p <- 2 * pnorm(-abs(beta / se_beta))
+  data.frame(beta = beta, se_beta = se_beta, pval = p)
+}
+
+# --- Define MR-link-2 ---
+mr_link2_loglik_reference_v2 <- function(th, lam, c_x, c_y, n_x, n_y) {
+  # Convert n_x and n_y to float
+  n_x <- as.numeric(n_x)
+  n_y <- as.numeric(n_y)
+  a <- th[1]
+  tX <- abs(th[2])
+  tY <- abs(th[3])
+  
+  Dyy <- 1 / (n_y * lam + tY)
+  
+  if (a != 0) {
+    Dxx <- 1 / (exp(log(a^2 * n_y + n_x) + log(lam)) + tX -
+                  exp(log(a^2 * n_y^2 * lam^2) - log(n_y * lam + tY)))
+    Dxy <- -Dxx * a * exp(log(n_y * lam) - log(n_y * lam + tY))
+    Dyy <- Dyy + exp(log(Dxx * (a^2 * n_y^2 * lam^2)) - (2 * log(n_y * lam + tY)))
+    asq_ny_sq_lam_sq_div_ny_lam_ty <- exp(log(a^2 * n_y^2 * lam^2) - log(n_y * lam + tY))
+  } else {
+    Dxx <- 1 / (exp(log(n_x) + log(lam)) + tX)
+    Dxy <- -Dxx * a * exp(log(n_y * lam) - log(n_y * lam + tY))
+    asq_ny_sq_lam_sq_div_ny_lam_ty <- 0 * lam
+  }
+  
+  dX <- n_x * c_x + a * n_y * c_y
+  dY <- n_y * c_y
+  m <- length(c_x)
+  
+  loglik <- -m * log(2 * pi) -
+    (1 / 2) * sum(log((a^2 * n_y + n_x) * lam + tX - asq_ny_sq_lam_sq_div_ny_lam_ty)) -
+    (1 / 2) * sum(log(n_y * lam + tY)) +
+    (1 / 2) * (sum(dX^2 * Dxx) + 2 * sum(dX * dY * Dxy) + sum(dY^2 * Dyy)) -
+    (n_x / 2) * sum((c_x^2) / lam) -
+    (n_y / 2) * sum((c_y^2) / lam) +
+    (m / 2) * (log(n_x) + log(n_y)) - sum(log(lam)) + (m / 2) * (log(tX) + log(tY))
+  
+  return(-loglik)
+}
+
+mr_link2_loglik_alpha_h0 <- function(th, lam, cX, cY, nX, nY) {
+  return(mr_link2_loglik_reference_v2(c(0, th[1], th[2]), lam, cX, cY, nX, nY))
+}
+
+mr_link2_loglik_sigma_y_h0 <- function(th, lam, c_x, c_y, n_x, n_y) {
+  n_x <- as.numeric(n_x)
+  n_y <- as.numeric(n_y)
+  a <- th[1]
+  tX <- abs(th[2])
+  
+  Dyy <- rep(0, length(lam))
+  
+  if (a != 0) {
+    Dxx <- 1 / (exp(log(a^2 * n_y + n_x) + log(lam)) + tX)
+    Dxy <- rep(0, length(lam))
+    asq_ny_sq_lam_sq_div_ny_lam_ty <- rep(0, length(lam))
+  } else {
+    Dxx <- 1 / (exp(log(n_x) + log(lam)) + tX)
+    Dxy <- rep(0, length(lam))
+    asq_ny_sq_lam_sq_div_ny_lam_ty <- rep(0, length(lam))
+  }
+  
+  dX <- n_x * c_x + a * n_y * c_y
+  dY <- n_y * c_y
+  m <- length(c_x)
+  
+  loglik <- -m * log(2 * pi) -
+    (1 / 2) * sum(log((a^2 * n_y + n_x) * lam + tX - asq_ny_sq_lam_sq_div_ny_lam_ty)) +
+    (1 / 2) * (sum(dX^2 * Dxx) + 2 * sum(dX * dY * Dxy) + sum(dY^2 * Dyy)) -
+    (n_x / 2) * sum((c_x^2) / lam) -
+    (n_y / 2) * sum((c_y^2) / lam) +
+    (m / 2) * (log(n_x) + log(n_y)) - sum(log(lam)) + (m / 2) * log(tX)
+  
+  return(-loglik)
+}
+
+
+
+mr_link2 <- function(selected_eigenvalues, selected_eigenvectors,
+                     exposure_betas, outcome_betas,
+                     n_exp, n_out, sigma_exp_guess, sigma_out_guess) {
+  
+  start_time <- Sys.time()
+  
+  # Define optimization options
+  method <- "Nelder-Mead"
+  control <- list(maxit = 300)
+  
+  # Calculate c_x and c_y
+  c_x <- t(selected_eigenvectors) %*% exposure_betas
+  c_y <- t(selected_eigenvectors) %*% outcome_betas
+  
+  max_sigma <- sqrt(.Machine$double.xmax)
+  
+  # Alpha h0 estimation
+  alpha_h0_guesses <- list(c(sigma_exp_guess, sigma_out_guess),
+                           c(max_sigma, max_sigma),
+                           c(1, max_sigma),
+                           c(1e3, 1e3))
+  
+  alpha_h0_results <- optim(par = alpha_h0_guesses[[1]],
+                            fn = mr_link2_loglik_alpha_h0,
+                            gr = NULL,
+                            selected_eigenvalues, c_x, c_y, n_exp, n_out,
+                            method = method, control = control)
+  
+  # Loop over other guesses
+  for (alpha_h0_guess in alpha_h0_guesses[-1]) {
+    if (alpha_h0_results$convergence == 0) break
+    
+    new_alpha_h0_results <- optim(par = alpha_h0_guess,
+                                  fn = mr_link2_loglik_alpha_h0,
+                                  gr = NULL,
+                                  selected_eigenvalues, c_x, c_y, n_exp, n_out,
+                                  method = method, control = control)
+    
+    if (alpha_h0_results$value >= new_alpha_h0_results$value) {
+      alpha_h0_results <- new_alpha_h0_results
+    }
+  }
+  
+  # Sigma_y estimation
+  sigma_y_guesses <- list(c(0.0, sigma_exp_guess),
+                          c(1.0, sigma_exp_guess),
+                          c(0.0, alpha_h0_results$par[1]),
+                          c(1.0, alpha_h0_results$par[1]),
+                          c(0.0, max_sigma),
+                          c(1e-10, max_sigma))
+  
+  sigma_y_h0_results <- optim(par = sigma_y_guesses[[1]],
+                              fn = mr_link2_loglik_sigma_y_h0,
+                              gr = NULL,
+                              selected_eigenvalues, c_x, c_y, n_exp, n_out,
+                              method = method, control = control)
+  
+  for (sigma_y_guess in sigma_y_guesses[-1]) {
+    if (sigma_y_h0_results$convergence == 0) break
+    
+    new_sigma_y_h0_results <- optim(par = sigma_y_guess,
+                                    fn = mr_link2_loglik_sigma_y_h0,
+                                    gr = NULL,
+                                    selected_eigenvalues, c_x, c_y, n_exp, n_out,
+                                    method = method, control = control)
+    
+    if (new_sigma_y_h0_results$value < sigma_y_h0_results$value) {
+      sigma_y_h0_results <- new_sigma_y_h0_results
+    }
+  }
+  
+  # Ha estimation
+  ha_guesses <- list(c(0.0, alpha_h0_results$par[1], alpha_h0_results$par[2]),
+                     c(sigma_y_h0_results$par[1], sigma_y_h0_results$par[2], sqrt(.Machine$double.xmax)),
+                     c(1.0, alpha_h0_results$par[1], alpha_h0_results$par[2]),
+                     c(1e-10, max_sigma, max_sigma))
+  
+  ha_results <- optim(par = ha_guesses[[1]],
+                      fn = mr_link2_loglik_reference_v2,
+                      gr = NULL,
+                      selected_eigenvalues, c_x, c_y, n_exp, n_out,
+                      method = method, control = control)
+  
+  for (ha_guess in ha_guesses[-1]) {
+    if (ha_results$convergence == 0) break
+    
+    new_ha_result <- optim(par = ha_guess,
+                           fn = mr_link2_loglik_reference_v2,
+                           gr = NULL,
+                           selected_eigenvalues, c_x, c_y, n_exp, n_out,
+                           method = method, control = control)
+    
+    if (new_ha_result$value < ha_results$value) {
+      ha_results <- new_ha_result
+    }
+  }
+  
+  # Likelihood Ratio Test and Estimation
+  alpha <- ha_results$par[1]
+  alpha_chi_sq <- 2 * (alpha_h0_results$value - ha_results$value)
+  alpha_p_val <- pchisq(alpha_chi_sq, df = 1, lower.tail = FALSE)
+  z_alpha <- ifelse(alpha_chi_sq <= 0, 0.0, sign(alpha) * sqrt(alpha_chi_sq))
+  se_alpha <- ifelse(z_alpha != 0, alpha / z_alpha, NA)
+  
+  sigma_y <- 1 / abs(ha_results$par[3])
+  sigma_y_chi_sq <- 2 * (sigma_y_h0_results$value - ha_results$value)
+  sigma_y_p_val <- pchisq(sigma_y_chi_sq, df = 1, lower.tail = FALSE)
+  z_sigma_y <- ifelse(sigma_y_chi_sq <= 0, 0.0, sqrt(sigma_y_chi_sq))
+  se_sigma_y <- ifelse(z_sigma_y != 0, sigma_y / z_sigma_y, NA)
+  
+  # Return results as a list (equivalent to Python's dictionary)
+  list(
+    alpha = alpha,
+    `se(alpha)` = se_alpha,
+    `p(alpha)` = alpha_p_val,
+    sigma_y = sigma_y,
+    `se(sigma_y)` = se_sigma_y,
+    `p(sigma_y)` = sigma_y_p_val,
+    sigma_x = 1 / abs(ha_results$par[2]),
+    alpha_h0_sigma_x = 1 / abs(alpha_h0_results$par[1]),
+    alpha_h0_sigma_y = 1 / abs(alpha_h0_results$par[2]),
+    alpha_h0_loglik = alpha_h0_results$value,
+    sigma_y_h0_alpha = sigma_y_h0_results$par[1],
+    sigma_y_h0_sigma_x = 1 / abs(sigma_y_h0_results$par[2]),
+    sigma_y_h0_loglik = sigma_y_h0_results$value,
+    ha_loglik = ha_results$value,
+    optim_alpha_h0_success = alpha_h0_results$convergence == 0,
+    optim_alpha_h0_nit = alpha_h0_results$counts,
+    optim_sigma_y_h0_success = sigma_y_h0_results$convergence == 0,
+    optim_sigma_y_h0_nit = sigma_y_h0_results$counts,
+    optim_ha_success = ha_results$convergence == 0,
+    optim_ha_nit = ha_results$counts,
+    function_time = as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+  )
+}
+
+remove_highly_correlated <- function(ld_matrix, snp_ordering, max_correlation) {
+  # Remove NAs from the correlation matrix
+  ld_matrix[is.na(ld_matrix)] <- 0
+  
+  # Initialize a logical vector to mark rows/columns to remove
+  idxs_to_remove <- rep(FALSE, nrow(ld_matrix))
+  
+  # Find pairs of SNPs that are highly correlated
+  correlated_indices <- which(abs(ld_matrix) >= max_correlation, arr.ind = TRUE)
+  
+  to_remove <- vector("logical", length = nrow(ld_matrix))
+  
+  # Loop through correlated pairs and mark SNPs to remove
+  for (i in seq_len(nrow(correlated_indices))) {
+    a <- correlated_indices[i, 1]
+    b <- correlated_indices[i, 2]
+    
+    if ((!to_remove[a] && !to_remove[b] ) && (a != b)) {
+      to_remove[b] <- TRUE
+    }
+  }
+  
+  # Remove highly correlated SNPs from both the matrix and the SNP list
+  ld_matrix <- ld_matrix[!to_remove, !to_remove]
+  pruned_snps <- snp_ordering[!to_remove]
+  
+  return(list(ld_matrix = ld_matrix, pruned_snps = pruned_snps))
+}
+
+mr_link2_analysis <- function(exposure_betas, outcome_betas, ld_matrix, n_exp, n_out, max_correlation = 0.99) {
+  # Prune highly correlated SNPs
+  snp_ordering <- seq_len(nrow(ld_matrix))  # Simple numbering for SNPs
+  pruned_data <- remove_highly_correlated(ld_matrix, snp_ordering, max_correlation)
+  pruned_ld_matrix <- pruned_data$ld_matrix
+  pruned_snps <- pruned_data$pruned_snps
+  
+  if (nrow(pruned_ld_matrix) < 3) {
+    return(list(alpha = NA,
+                `se(alpha)` = NA,
+                `p(alpha)` = NA))
+  }
+  
+  # Eigenvalue decomposition
+  eigen_decomp <- eigen(pruned_ld_matrix)
+  eigenvalues <- eigen_decomp$values
+  eigenvectors <- eigen_decomp$vectors
+  
+  # Calculate cumulative variance explained
+  variance_explained <- cumsum(eigenvalues) / sum(eigenvalues)
+  
+  # Select the eigenvectors that explain at least 99% of the variance
+  threshold_index <- min(which(variance_explained >= 0.99))
+  selected_eigenvectors <- eigenvectors[, 1:threshold_index]
+  selected_eigenvalues <- eigenvalues[1:threshold_index]
+  
+  # Call the existing MR-link-2 function
+  # Assuming `mr_link2` is already defined in R and takes the following arguments:
+  # - selected_eigenvalues
+  # - selected_eigenvectors
+  # - exposure_betas
+  # - outcome_betas
+  # - n_exp (number of individuals in exposure dataset)
+  # - n_out (number of individuals in outcome dataset)
+  sigma_exp_guess <- 0.01  # You can adjust or estimate this as needed
+  sigma_out_guess <- 0.001  # You can adjust or estimate this as needed
+  
+  # Subset the betas based on pruned SNPs
+  exposure_betas_pruned <- exposure_betas[pruned_snps]
+  outcome_betas_pruned <- outcome_betas[pruned_snps]
+  
+  # Perform the MR-link-2 estimation
+  mr_result <- mr_link2(
+    selected_eigenvalues = selected_eigenvalues,
+    selected_eigenvectors = selected_eigenvectors,
+    exposure_betas = exposure_betas_pruned,
+    outcome_betas = outcome_betas_pruned,
+    n_exp = n_exp,
+    n_out = n_out,
+    sigma_exp_guess = sigma_exp_guess,
+    sigma_out_guess = sigma_out_guess
+  )
+  
+  return(mr_result)
+}
+
+########### select causal SNPs in sparse genetic architecture #########
+# -------------------------------------------------------------------
+# Apply MR-Link Python logic: select_causal_snps_base
+# -------------------------------------------------------------------
+select_causal_snps_base <- function(
+    n_exp_causal,
+    n_out_causal,
+    n_overlap,
+    R,                 # LD matrix
+    upper_ld_bound,
+    lower_ld_bound
+) {
+  m <- nrow(R)
+  R2 <- R^2
+  
+  # -------------------------------
+  # Step 1: Exposure SNPs
+  # -------------------------------
+  exp_snps <- rep(NA_integer_, n_exp_causal)
+  
+  # choose first SNP randomly
+  exp_snps[1] <- sample.int(m, 1)
+  i <- 2
+  
+  while (i <= n_exp_causal) {
+    
+    # LD < upper bound with ALL selected SNPs
+    below_upper <- colSums(R2[exp_snps[1:(i-1)], , drop=FALSE] < upper_ld_bound) == (i-1)
+    
+    if (lower_ld_bound >= 0) {
+      # LD ≥ lower bound with AT LEAST ONE selected SNP
+      above_lower <- colSums(R2[exp_snps[1:(i-1)], , drop=FALSE] >= lower_ld_bound) >= 1
+      
+      candidates <- which(below_upper & above_lower)
+      if (length(candidates) == 0)
+        stop("Could not find causal SNP satisfying LD window")
+    } else {
+      candidates <- which(below_upper)
+    }
+    
+    exp_snps[i] <- sample(candidates, 1)
+    i <- i + 1
+  }
+  
+  # -------------------------------
+  # Step 2: Overlapping SNPs
+  # -------------------------------
+  overlap_snps <- if (n_overlap > 0) sample(exp_snps, n_overlap) else integer(0)
+  
+  # -------------------------------
+  # Step 3: Remaining pleiotropic SNPs
+  # -------------------------------
+  remaining <- n_out_causal - n_overlap
+  
+  if (remaining > 0) {
+    out_snps <- rep(NA_integer_, remaining)
+    
+    # non-overlapping exposure SNPs, permuted
+    exp_non_overlap <- setdiff(exp_snps, overlap_snps)
+    exp_non_overlap <- sample(exp_non_overlap)
+    
+    j <- 1
+    for (snp in exp_non_overlap) {
+      if (j > remaining) break
+      
+      ld_row <- R2[snp, ]
+      
+      candidates <- which(ld_row >= lower_ld_bound & ld_row < upper_ld_bound)
+      if (length(candidates) == 0)
+        stop("Cannot find LD-window SNP for pleiotropy")
+      
+      out_snps[j] <- sample(candidates, 1)
+      j <- j + 1
+    }
+    
+    out_snps <- c(overlap_snps, out_snps)
+  } else {
+    out_snps <- overlap_snps
+  }
+  
+  list(exposure = exp_snps, outcome = out_snps)
+}
+
+# -------------------------------------------------------------------
+#  (Apply MR-link Python logic: select_causal_snps)
+# -------------------------------------------------------------------
+select_causal_snps <- function(n_exp_causal,
+                               n_out_causal,
+                               n_overlap,
+                               R,
+                               n_reps,
+                               upper_ld_bound,
+                               lower_ld_bound,
+                               max_failures = 5) {
+  
+  m <- nrow(R)
+  exposure_mat <- matrix(FALSE, m, n_reps)
+  outcome_mat  <- matrix(FALSE, m, n_reps)
+  
+  rep <- 1
+  failures <- 0
+  
+  while (rep <= n_reps) {
+    if (failures >= max_failures)
+      stop("Unable to perform correct instrument selection")
+    
+    out <- tryCatch({
+      select_causal_snps_base(
+        n_exp_causal,
+        n_out_causal,
+        n_overlap,
+        R,
+        upper_ld_bound,
+        lower_ld_bound
+      )
+    }, error = function(e) e)
+    
+    if (inherits(out, "error")) {
+      failures <- failures + 1
+    } else {
+      exposure_mat[out$exposure, rep] <- TRUE
+      outcome_mat[out$outcome,  rep]  <- TRUE
+      rep <- rep + 1
+      failures <- 0
+    }
+  }
+  
+  list(exposure = exposure_mat, outcome = outcome_mat)
+}
+
+# -------------------------------------------------------------------
+#  Main  data-generating mechanism code
+# -------------------------------------------------------------------
+simulate_exp_outcome_sumstats <- function(
+    R_mat,                     # LD matrix (same role as r_mat in Python)
+    causal_effect = 0.2,
+    n_exp = 30000,
+    n_out = 90000,
+    exp_h2 = 0.1,
+    out_h2 = 0,
+    m_causal_exp = 10,
+    m_causal_out = 10,
+    min_ld_between_causal = 0.0,
+    max_ld_between_causal = 1.0
+) {
+  
+  J <- nrow(R_mat)
+  
+  # ===== 1. Select causal SNPs (MR-link logic) =====
+  snp_sel <- select_causal_snps(
+    n_exp_causal = m_causal_exp,
+    n_out_causal = m_causal_out,
+    n_overlap = 0,
+    R = R_mat,
+    n_reps = 1,
+    upper_ld_bound = max_ld_between_causal,
+    lower_ld_bound = min_ld_between_causal
+  )
+  
+  causal_X <- which(snp_sel$exposure[,1])
+  causal_Y <- which(snp_sel$outcome[,1])
+  
+  # ===== 2. Generate true SNP-exposure/outcome effects =====
+  sigma_exp <- sqrt(exp_h2 / m_causal_exp)
+  sigma_out <- sqrt(out_h2 / m_causal_out)
+  
+  gamX <- rep(0, J)
+  gamY <- rep(0, J)
+  
+  gamX[causal_X] <- rnorm(length(causal_X), 0, sigma_exp)
+  gamY[causal_Y] <- rnorm(length(causal_Y), 0, sigma_out)
+
+  gamX <- as.numeric(gamX)
+  gamY <- as.numeric(gamY)
+
+  # ===== 3. Generate observed SNP-exposure/outcome with LD projection =====
+  # Noise variances 
+  noise_exp_cov <- R_mat * ((1 - exp_h2) / n_exp)
+  noise_out_cov <- R_mat * ((1 - causal_effect^2 * exp_h2 - out_h2) / n_out)
+  
+  noise_X <- as.numeric(MASS::mvrnorm(1, rep(0, J), noise_exp_cov))
+  noise_Y <- as.numeric(MASS::mvrnorm(1, rep(0, J), noise_out_cov))
+  noise_X <- as.numeric(noise_X)
+  noise_Y <- as.numeric(noise_Y)
+  
+  betX <- as.numeric(R_mat %*% gamX) + noise_X
+  betY <- as.numeric(R_mat %*% (causal_effect * gamX + gamY)) + noise_Y
+  
+  # ===== 4. Standard errors & Z-scores =====
+  seX <- sqrt((1 - exp_h2) / n_exp)
+  seY <- sqrt((1 - causal_effect^2 * exp_h2 - out_h2) / n_out)
+  
+  Zx <- betX / seX
+  Zy <- betY / seY
+  
+  # ===== 5. Conditional SNP-exposure/outcome assoc estimate for LDA-Egger =====
+  LDinv <- solve(R_mat)
+  
+  b_exp_cond <- LDinv %*% betX
+  b_out_cond <- LDinv %*% betY
+  
+  Sig_exp  <- LDinv %*% (R_mat * seX^2) %*% LDinv
+  Sig_out  <- LDinv %*% (R_mat * seY^2) %*% LDinv
+  
+  Sig_out_inv <- solve(Sig_out)
+  
+  # ===== Return sumstats =====
+  list(
+    LD = R_mat,
+    gamX = gamX,
+    gamY = gamY,
+    causal_X = causal_X,
+    causal_Y = causal_Y,
+    betX = drop(betX),
+    betY = drop(betY),
+    seX = rep(seX, J),
+    seY = rep(seY, J),
+    Zx = Zx,
+    Zy = Zy,
+    b_exp_cond = drop(b_exp_cond),
+    b_out_cond = drop(b_out_cond),
+    Sig_out_inv = Sig_out_inv,
+    n_exp = n_exp
+  )
+}
+
+################ Extract BETA, SE, P, LCI, UCI from MR result objects ########################
+safe <- function(expr) {
+  tryCatch(expr, error = function(e) return(NA))
+}
+
+extract_result <- function(method_name, beta, se, p) {
+  if (any(is.na(c(beta, se, p)))) {
+    return(data.table(method = method_name, beta = NA, se = NA, p = NA,
+                      LCI = NA, UCI = NA))
+  }
+  LCI = beta - 1.96 * se
+  UCI = beta + 1.96 * se
+  data.table(method = method_name, beta = beta, se = se, p = p, LCI = LCI, UCI = UCI)
+}
+
+########################### MR performing engine #############################
+run_methods <- function(sim) {
+  
+  LD_mat <- sim$LD
+  bx   <- as.numeric(sim$betX)
+  bxse <- as.numeric(sim$seX)
+  by   <- as.numeric(sim$betY)
+  byse <- as.numeric(sim$seY)
+  
+  mr_obj.correl <- MendelianRandomization::mr_input(
+    bx = bx, bxse = bxse, by = by, byse = byse, corr = LD_mat)
+  
+  results <- list()
+  
+  ### 1. gIVW
+  givw <- safe(MendelianRandomization::mr_ivw(mr_obj.correl, 
+                                              model = "default",
+                                              correl = TRUE,
+                                              distribution = "normal",
+                                              alpha = 0.05))
+  results[[1]] <- extract_result("gIVW",
+                                 beta = safe(givw@Estimate),
+                                 se   = safe(givw@StdError),
+                                 p    = safe(givw@Pvalue))
+  
+  ### 2. gEgger
+  gegger <- safe(MendelianRandomization::mr_egger(mr_obj.correl, 
+                                                  correl = TRUE,
+                                                  distribution = "normal",
+                                                  alpha = 0.05))
+  results[[2]] <- extract_result("gEgger",
+                                 beta = safe(gegger@Estimate),
+                                 se   = safe(gegger@StdError.Est),
+                                 p    = safe(gegger@Pvalue.Est))
+  
+  ### 3. PC-GMM
+  pc_gmm <- safe(MendelianRandomization::mr_pcgmm(mr_obj.correl, 
+                                                  nx = sim$n_exp,
+                                                  ny = 90000,
+                                                  r = 170, thres = 0.999,
+                                                  robust = TRUE, alpha = 0.05))
+  results[[3]] <- extract_result("PC-GMM",
+                                 beta = safe(pc_gmm@Estimate),
+                                 se   = safe(pc_gmm@StdError),
+                                 p    = safe(pc_gmm@Pvalue))
+  
+  ### 4. LDA-Egger
+  lda_egger <- safe(LDA.MREgger(sim$b_exp_cond, sim$b_out_cond, sim$Sig_out_inv))
+  results[[4]] <- extract_result("LDA-Egger",
+                                 beta = safe(lda_egger[2,1]),
+                                 se   = safe(sqrt(lda_egger[2,2])),
+                                 p    = safe(lda_egger[2,4]))
+  
+  ### 5. PCA-IVW
+  pca_ivw <- safe(pca_ivw(bx, by, byse, LD_mat))
+  results[[5]] <- extract_result("PCA-IVW",
+                                 beta = safe(pca_ivw$beta),
+                                 se   = safe(pca_ivw$se_beta),
+                                 p    = safe(pca_ivw$pval))
+  
+  ### 6. MR-link-2
+  mr_link_2 <- safe(mr_link2_analysis(bx, by, LD_mat, sim$n_exp, 90000))
+  results[[6]] <- extract_result("MR-link-2",
+                                 beta = safe(mr_link_2$alpha),
+                                 se   = safe(mr_link_2$`se(alpha)`),
+                                 p    = safe(mr_link_2$`p(alpha)`))
+  
+  rbindlist(results)
+}
+
+###################### Looping code to generate GWAS summary statistics and run MR on generated data  ##################
+
+worker_results <- mclapply(seq_len(n_core), function(wid) {
+  
+  .Random.seed <- worker_streams[[wid]]
+  
+  L <- vector("list", n_sim_per_core)
+  
+  for (r in 1:n_sim_per_core) {
+    
+    .Random.seed <- parallel::nextRNGSubStream(.Random.seed)
+    
+    sim <- simulate_exp_outcome_sumstats(
+      R_mat = Sigma_reg,
+      causal_effect = P$gamma,
+      n_exp  = P$n_exp,
+      n_out  = n_out,
+      exp_h2 = exp_h2,
+      out_h2 = P$out_h2,
+      m_causal_exp = P$n_causal,
+      m_causal_out = P$n_causal,
+      min_ld_between_causal = P$ld_min,
+      max_ld_between_causal = P$ld_max
+    )
+    
+    M <- run_methods(sim)
+    
+    M[, `:=`(
+      sim_id = (wid - 1L) * n_sim_per_core + r,
+      combo_id = P$combo_id,
+      n_exp = P$n_exp,
+      gamma = P$gamma,
+      out_h2 = P$out_h2,
+      rho = P$rho,
+      n_causal = P$n_causal,
+      ld_min = P$ld_min,
+      ld_max = P$ld_max
+    )]
+    
+    L[[r]] <- M
+  }
+  
+  rbindlist(L)
+  
+}, mc.cores = n_core, mc.preschedule = TRUE)
+
+############# Compile result files #############
+final <- rbindlist(worker_results)
+
+suffix <- sprintf("_%03d", as.integer(combo_id))
+outfile <- file.path(outdir, sprintf("mr_corr_sims_realLD_sparse_combo%s.csv", suffix))
+write.csv(final, outfile, row.names = FALSE)
