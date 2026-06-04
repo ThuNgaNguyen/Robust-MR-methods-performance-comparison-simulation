@@ -109,7 +109,7 @@ generate_2_sumstats <- function(J, theta,
   
   ###Pleiotropy scenario assigning
   J_invalid <- if (scenario == 1L) 0L else floor(inval_frac * J)
-  invalid_idx <- if (J_invalid > 0) sample.int(J, J_invalid, replace = FALSE) else integer(0) #can include strong IV
+  invalid_idx <- if (J_invalid > 0) sample.int(J, J_invalid, replace = FALSE) else integer(0) #strong IV might be pleiotropic
   alpha <- rep(0, J)
   if (scenario == 2L && J_invalid > 0) alpha[invalid_idx] <- rnorm(J_invalid, 0, 0.02) #balanced
   if (scenario == 3L && J_invalid > 0) alpha[invalid_idx] <- runif(J_invalid, 0, 0.02) #directional
