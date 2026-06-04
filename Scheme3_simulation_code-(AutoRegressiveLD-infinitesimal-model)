@@ -24,9 +24,8 @@ n_exp  <- c(400, 30000) #exposure sample size
 n_out         <- 90000  #outcome sample size
 J   <- 4000 #number of instruments
 PVE_x   <- 0.01 #exposure cis-effect 
-PVE_y   <- c(0.0, 0.01, 0.04) #to compute causal effect estimate: alpha = sqrt(PVE_y)
+PVE_y   <- c(0.0, 0.01, 0.04) #to compute causal effect estimate: gamma = sqrt(PVE_y)
 PVE_GY <- c(0,0.01) #pleiotropic effect
-gamma <- c(0, 0.0005) #direct effect of SNP on outcome
 rho_values    <- c(0.125, 0.9) #AR(1) decay parameter
 tau <- c(0,10) #Directional pleiotropy shift, balanced pleiotropy (0) versus strong directional pleiotropy (10)
 
