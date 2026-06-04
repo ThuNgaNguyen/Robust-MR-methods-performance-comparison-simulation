@@ -1,0 +1,394 @@
+# ======= Reproducible single-thread math (avoid hidden parallel RNG) =======
+if (requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+  RhpcBLASctl::blas_set_num_threads(1L)
+  RhpcBLASctl::omp_set_num_threads(1L)
+} else {
+  Sys.setenv(
+    OMP_NUM_THREADS        = "1",
+    OPENBLAS_NUM_THREADS   = "1",
+    MKL_NUM_THREADS        = "1",
+    BLIS_NUM_THREADS       = "1",
+    VECLIB_MAXIMUM_THREADS = "1",
+    R_MAX_NUM_DLLS         = "200"
+  )
+}
+
+## ======= Package loading =======
+rm(list = ls())
+library(MendelianRandomization)
+library(dplyr)
+library(ggplot2)
+library(MRPRESSO)
+library(IMRP)
+library(BWMR)
+library(robustbase)
+library(parallel)
+
+source("~/BWMR_updated.R") #Download from https://github.com/jiazhao97/BWMR
+
+outdir <- " "
+
+## ------------------- Global config --------------------------
+base_seed <- 20251019L
+nsim      <- 1000L              # total replicates per (combo)
+
+Nx <- 30000L #exposure GWAS sample size
+Ny <- 90000L #outcome GWAS sample size
+MAF <- 0.30 #minor allele frequency 
+
+# Design grid 
+
+theta_grid   <- c(0, 0.2) #true MR causal effect estimate
+variant_grid <- c(5L, 10L, 15L, 20L) #number of IVs used
+invalid_grid <- c(0.2, 0.4, 0.6) #proportion of invalid instruments
+
+design_s1 <- expand.grid(
+  scenario   = 1L,
+  inval_frac = 0,  #no pleiotropy
+  J          = variant_grid,
+  theta      = theta_grid,
+  KEEP.OUT.ATTRS = FALSE
+)
+design_s234 <- expand.grid(
+  scenario   = 2:4,  #balanced, directional, and correlated pleiotropy, respectively
+  inval_frac = invalid_grid,
+  J          = variant_grid,
+  theta      = theta_grid,
+  KEEP.OUT.ATTRS = FALSE
+)
+
+design <- rbind(design_s1, design_s234)
+rownames(design) <- NULL
+design$combo_id <- seq_len(nrow(design))
+
+## ----- choose combos and chunks (80 combos/configurations in total) -----
+#example: target_ids <- c(10L, 92L, 93L, 94L, 95L, 96L, 97L, 98L, 99L, 100L)
+n_chunks   <- as.integer(Sys.getenv("N_CHUNKS", "8"))
+
+# Map SLURM array index -> (combo_id, chunk_id)
+grid <- expand.grid(combo_id = target_ids, chunk_id = seq_len(n_chunks))
+grid <- grid[order(grid$combo_id, grid$chunk_id), , drop = FALSE]
+
+task_id <- as.integer(Sys.getenv("SLURM_ARRAY_TASK_ID", "1"))
+stopifnot(task_id >= 1L, task_id <= nrow(grid))
+
+combo_id <- grid$combo_id[task_id]
+chunk_id <- grid$chunk_id[task_id]
+
+# Select the single DGM row for that combo
+di <- design[design$combo_id == combo_id, , drop = FALSE]
+stopifnot(nrow(di) == 1L)
+
+## ----- chunk the repetitions to run across nodes -----
+nsim_total <- nsim
+reps_start <- floor((chunk_id-1) * nsim_total / n_chunks) + 1L
+reps_end   <- floor(chunk_id     * nsim_total / n_chunks)
+reps_this  <- reps_end - reps_start + 1L
+stopifnot(reps_this > 0L)
+
+# Allocate per-worker replicates
+n_cpus <- 25L
+reps_base  <- reps_this %/% n_cpus
+reps_extra <- reps_this %%  n_cpus
+
+## ------------------- RNG: streams (per DGM) + substreams (per worker/cpu) ----
+# Use L’Ecuyer–CMRG for independent streams/substreams
+## ----- RNG: one stream per (combo, chunk), substreams per worker -----
+RNGkind("L'Ecuyer-CMRG")
+set.seed(base_seed + combo_id*1000L + chunk_id)
+
+worker_streams <- vector("list", n_cpus)
+worker_streams[[1]] <- .Random.seed
+for (i in 2:n_cpus) worker_streams[[i]] <- parallel::nextRNGStream(worker_streams[[i - 1]])
+
+## ------------------- univariate GWAS function -------------
+variant_association <- function(G, y) {
+  n <- length(y)
+  Gc <- G - mean(G)
+  varG <- sum(Gc^2)
+  beta <- sum(Gc * (y - mean(y))) / varG
+  resid <- y - (mean(y) + beta * Gc)
+  sigma2 <- sum(resid^2) / (n - 2)
+  se <- sqrt(sigma2 / varG)
+  c(beta = beta, se = se)
+}
+
+gwas_univ <- function(Gmat, y) {
+  J <- ncol(Gmat)
+  out <- matrix(NA_real_, nrow = J, ncol = 2,
+                dimnames = list(NULL, c("beta", "se")))
+  for (j in seq_len(J)) out[j, ] <- variant_association(Gmat[, j], y)
+  out
+}
+
+## ------------------- Data generator (GWAS summary statistics) function -------------------------
+generate_2_sumstats <- function(J, theta, scenario, Nx, Ny, maf = 0.3, inval_frac = 0) {
+  if (!(scenario %in% 1:4)) stop("scenario must be 1..4")
+  if (inval_frac < 0 || inval_frac > 1) stop("inval_frac in [0,1]")
+
+  # Genetic dosage
+  Gx <- matrix(rbinom(Nx * J, 2L, maf), nrow = Nx, ncol = J) #genetic dosage in exposure sample
+  Gy <- matrix(rbinom(Ny * J, 2L, maf), nrow = Ny, ncol = J) #genetic dosage in outcome sample
+  colnames(Gx) <- colnames(Gy) <- paste0("SNP", seq_len(J))
+
+  # Errors of exposure, outcome
+  eXx <- rnorm(Nx, 0, 0.5) #exposure error in exposure sample
+  eXy <- rnorm(Ny, 0, 0.5) #exposure error in outcome sample
+  eY  <- rnorm(Ny, 0, 0.5) #outcome error in outcome sample
+
+  # SNP-Exposure association effects
+  gammaX <- runif(J, 0.2, 0.7)
+
+  # Invalid IV selection
+  J_invalid   <- floor(inval_frac * J)
+  invalid_idx <- if (J_invalid > 0) sample.int(J, J_invalid, replace = FALSE) else integer(0)
+
+  # betaY - pleiotropy effect not associated with X, delta - correlated pleiotropy effect
+  betaY <- rep(0, J)
+  delta <- rep(0, J)
+
+  if (scenario == 2 && J_invalid > 0) betaY[invalid_idx] <- runif(J_invalid, -0.2, 0.2)
+  if (scenario == 3 && J_invalid > 0) betaY[invalid_idx] <- runif(J_invalid, 0, 0.2)
+  if (scenario == 4 && J_invalid > 0) delta[invalid_idx] <- runif(J_invalid, 0, 0.2)
+
+  # Confounder channels
+  Ux <- if (scenario == 4L) as.vector(Gx %*% delta) else rep(0, Nx)
+  Uy <- if (scenario == 4L) as.vector(Gy %*% delta) else rep(0, Ny)
+
+  # Phenotypes in exposure, outcome sample
+  Xx <- as.numeric(Gx %*% gammaX) + Ux + eXx #exposure phenotype in exposure sample
+  Xy <- as.numeric(Gy %*% gammaX) + Uy + eXy #exposure phenotype in outcome sample
+  Yy <- theta * Xy + as.numeric(Gy %*% betaY) + eY + Uy #outcome phenotype in outcome sample
+
+  # Per-SNP GWAS
+  bx <- gwas_univ(Gx, Xx)
+  by <- gwas_univ(Gy, Yy)
+
+  # GWAS output saving
+  data.frame(
+    bx  = bx[, "beta"],  bxse = bx[, "se"],
+    by  = by[, "beta"],  byse = by[, "se"],
+    SNP = paste0("SNP", seq_len(J)),
+    check.names = FALSE
+  )
+}
+
+## ------------------- Try to get field BETA, SE, P, 95% CIs in results objects ----
+.get_field <- function(obj, candidates) {
+  if (isS4(obj)) {
+    sn <- slotNames(obj)
+    for (nm in candidates) if (nm %in% sn) {
+      val <- tryCatch(slot(obj, nm), error = function(e) NULL)
+      if (!is.null(val)) return(suppressWarnings(as.numeric(val[1L])))
+    }
+  }
+  if (!is.list(obj)) return(NA_real_)
+  nn <- names(obj)
+  for (nm in candidates) {
+    if (!is.null(nn) && nm %in% nn) {
+      val <- obj[[nm]]
+      if (is.list(val) && length(val) >= 1L) val <- val[[1L]]
+      return(suppressWarnings(as.numeric(val[1L])))
+    }
+  }
+  NA_real_
+}
+
+.derive_se_from_ci <- function(LCI, UCI, level = 0.95) {
+  if (is.finite(LCI) && is.finite(UCI)) {
+    z <- qnorm(1 - (1 - level)/2)
+    (UCI - LCI) / (2 * z)
+  } else NA_real_
+}
+
+## ------------------- Extract BETA, SE, P, 95% CIs in results objects ----
+tidy_one <- function(method_name, obj) {
+  as_row <- function(est = NA_real_, se = NA_real_, p = NA_real_,
+                     LCI = NA_real_, UCI = NA_real_) {
+    data.frame(method = method_name, estimate = est, se = se, p = p,
+               LCI = LCI, UCI = UCI, stringsAsFactors = FALSE)
+  }
+  if (method_name == "MRPRESSO") return(tidy_presso(obj))
+  if (inherits(obj, "mr_error") || is.null(obj)) return(as_row())
+
+  ci_only <- method_name %in% c("HetPen", "ConMix")
+  est <- .get_field(obj, c("Estimate", "beta", "CausalEstimate"))
+  p   <- .get_field(obj, c("Pvalue","P_value","Causal_p","Pvalue.Est"))
+  LCI <- .get_field(obj, c("CILower","CILower.Est"))
+  UCI <- .get_field(obj, c("CIUpper","CIUpper.Est"))
+
+  if (ci_only) return(as_row(est, se = NA_real_, p = p, LCI = LCI, UCI = UCI))
+
+  se <- .get_field(obj, c("StdError","StdError.Est","SdCausalEstimate","se_beta"))
+  if (!is.finite(se) && (is.finite(LCI) || is.finite(UCI))) se <- .derive_se_from_ci(LCI, UCI, 0.95)
+  if ((!is.finite(LCI) || !is.finite(UCI)) && is.finite(est) && is.finite(se)) {
+    LCI <- est - 1.96*se; UCI <- est + 1.96*se
+  }
+  if (!is.finite(p) && is.finite(est) && is.finite(se) && se > 0) {
+    p <- 2 * pnorm(abs(est / se), lower.tail = FALSE)
+  }
+  as_row(est, se, p, LCI, UCI)
+}
+
+######################## Try to catch BETA, SE, P, 95% CIs from MRPRESSO #########################
+tidy_presso <- function(obj) {
+  as_row <- function(est = NA_real_, se = NA_real_, p = NA_real_,
+                     LCI = NA_real_, UCI = NA_real_) {
+    data.frame(method = "MRPRESSO", estimate = est, se = se, p = p,
+               LCI = LCI, UCI = UCI, stringsAsFactors = FALSE)
+  }
+  if (inherits(obj, "mr_error") || is.null(obj)) return(as_row())
+
+  tbl <- obj[["Main MR results"]]
+  if (is.null(tbl) || !is.data.frame(tbl) || nrow(tbl) < 1) return(as_row())
+
+  est_col <- grep("Causal", names(tbl), value = TRUE)[1]
+  se_col  <- grep("Sd", names(tbl), value = TRUE, ignore.case = TRUE)[1]
+  p_col   <- grep("^P", names(tbl), value = TRUE, ignore.case = TRUE)[1]
+
+  # prefer row 2 (outlier-corrected) if present, else row 1
+  pick <- 1L
+  if (nrow(tbl) >= 2L) {
+    est2_num <- if (!is.null(est_col)) suppressWarnings(as.numeric(tbl[[est_col]][2])) else NA_real_
+    se2_num  <- if (!is.null(se_col))  suppressWarnings(as.numeric(tbl[[se_col]][2]))  else NA_real_
+    if (is.finite(est2_num) || is.finite(se2_num)) pick <- 2L
+  }
+
+  getn <- function(col, row) if (!is.null(col)) suppressWarnings(as.numeric(tbl[[col]][row])) else NA_real_
+  est <- getn(est_col, pick)
+  se  <- getn(se_col,  pick)
+  p   <- getn(p_col,   pick)
+
+
+  if (is.finite(est) && is.finite(se)) {
+    LCI <- est - 1.96*se; UCI <- est + 1.96*se
+  } else {
+    LCI <- NA_real_; UCI <- NA_real_
+  }
+  as_row(est, se, p, LCI, UCI)
+}
+
+######################## MR suite engine #########################
+
+run_mr_suite_14 <- function(df, Nx, Ny, presso_nb = 1000L) {
+  out <- list()
+  MR_obj <- MendelianRandomization::mr_input(
+    bx   = df$bx,   bxse = df$bxse,
+    by   = df$by,   byse = df$byse,
+    snps = df$SNP
+  )
+  safe <- function(expr, name) {
+    tryCatch({ out[[name]] <<- eval(expr); NULL },
+             error = function(e) { out[[name]] <<- structure(list(error = conditionMessage(e)), class = "mr_error"); NULL })
+  }
+
+  safe(quote(MendelianRandomization::mr_ivw(MR_obj, robust = FALSE, distribution = "normal",
+                                            penalized = FALSE, alpha = 0.05, correl = FALSE)), "IVW")
+  safe(quote(MendelianRandomization::mr_maxlik(MR_obj, model = "default", correl = FALSE,
+                                               distribution = "normal", psi = 0, alpha = 0.05)), "MaxLik")
+  safe(quote(MendelianRandomization::mr_egger(MR_obj, robust = FALSE, distribution = "normal",
+                                              penalized = FALSE, alpha = 0.05, correl = FALSE)), "Egger")
+  safe(quote(MendelianRandomization::mr_median(MR_obj, distribution = "normal",
+                                               weighting = "weighted", alpha = 0.05)), "WMEDIAN")
+  safe(quote(MendelianRandomization::mr_mbe(MR_obj, distribution = "normal",
+                                            weighting = "weighted", stderror = "simple",
+                                            phi = 1, alpha = 0.05)), "MBE_w")
+  safe(quote(MendelianRandomization::mr_lasso(MR_obj, distribution = "normal", alpha = 0.05,
+                                              lambda = numeric(0))), "LASSO")
+  safe(quote(MendelianRandomization::mr_ivw(MR_obj, robust = TRUE, distribution = "normal",
+                                            penalized = FALSE, alpha = 0.05, correl = FALSE,
+                                            control = robustbase::lmrob.control(setting = "KS2014"))), "IVW_robust")
+  safe(quote(MendelianRandomization::mr_ivw(MR_obj, robust = TRUE, distribution = "normal",
+                                            penalized = TRUE, alpha = 0.05, correl = FALSE)), "IVW_robust_pen")
+  safe(quote(MendelianRandomization::mr_hetpen(MR_obj, prior = 0.5,
+                                               CIMin = -5, CIMax = 5, CIStep = 0.001, alpha = 0.05)), "HetPen")
+  safe(quote(MendelianRandomization::mr_conmix(MR_obj, psi = 0, CIMin = NA, CIMax = NA,
+                                               CIStep = 0.01, alpha = 0.05)), "ConMix")
+
+  # cML-MA
+  safe(quote(MendelianRandomization::mr_cML(MR_obj, MA = TRUE, DP = TRUE,
+                                            K_vec = 0:(length(MR_obj@betaX)-2),
+                                            random_start = 0, num_pert = 200, random_start_pert = 0,
+                                            maxit = 100, random_seed = 314, n = Nx, Alpha = 0.05)), "cML_MA")
+
+  # IMRP (uses standardized summary stats)
+  df_imrp <- transform(df,
+                       x1    = bx / bxse / sqrt(Nx),
+                       x2    = by / byse / sqrt(Ny),
+                       x1_se = 1/sqrt(Nx),
+                       x2_se = 1/sqrt(Ny))
+  safe(quote(IMRP::MR_pleio("x2","x1","x2_se","x1_se",
+                            as.data.frame(df_imrp), SignifThreshold=0.05,
+                            rho=0.03, method="IVW")), "IMRP")
+
+  # MR-PRESSO
+  safe(quote(MRPRESSO::mr_presso(BetaOutcome = "by", BetaExposure = "bx",
+                                 SdOutcome = "byse", SdExposure = "bxse",
+                                 OUTLIERtest = TRUE, DISTORTIONtest = TRUE,
+                                 NbDistribution = as.integer(presso_nb),
+                                 SignifThreshold = 0.05, data = df)), "MRPRESSO")
+
+  # BWMR 
+    safe(quote(BWMR(gammahat = df$bx, Gammahat = df$by,
+                    sigmaX = df$bxse, sigmaY = df$byse)), "BWMR")
+  
+  out
+}
+
+## ------------------- Main simulation loop ----------------------
+options(mc.cores = 1L)
+
+worker_results <- mclapply(seq_len(n_cpus), function(worker_id) {
+  .Random.seed <- worker_streams[[worker_id]]
+  reps_w <- reps_base + as.integer(worker_id <= reps_extra)
+  out_list <- vector("list", reps_w)
+
+  worker_offset <- (worker_id - 1L) * reps_base + pmin(worker_id - 1L, reps_extra)
+
+  for (r in seq_len(reps_w)) {
+    .Random.seed <- parallel::nextRNGSubStream(.Random.seed)
+
+    df <- generate_2_sumstats(
+      J = di$J, theta = di$theta, scenario = di$scenario,
+      Nx = Nx, Ny = Ny, maf = MAF, inval_frac = di$inval_frac
+    )
+
+    mr_list  <- run_mr_suite_14(df, Nx = Nx, Ny = Ny, presso_nb = 1000L)
+
+    est_rows <- do.call(rbind, Map(tidy_one, names(mr_list), mr_list))
+    est_rows$scenario   <- di$scenario
+    est_rows$J          <- di$J
+    est_rows$theta_true <- di$theta
+    est_rows$inval_frac <- di$inval_frac
+    est_rows$combo_id   <- combo_id
+    est_rows$repetition <- reps_start + worker_offset + (r - 1L)
+
+    out_list[[r]] <- est_rows
+  }
+  dplyr::bind_rows(out_list)
+}, mc.cores = n_cpus)
+
+results_df <- dplyr::bind_rows(worker_results) %>%
+  mutate(
+    scenario   = as.integer(scenario),
+    J          = as.integer(J),
+    theta_true = as.numeric(theta_true),
+    inval_frac = as.numeric(inval_frac),
+    combo_id   = as.integer(combo_id),
+    repetition = as.integer(repetition),
+    estimate   = as.numeric(estimate),
+    se         = as.numeric(se),
+    p          = as.numeric(p),
+    LCI        = as.numeric(LCI),
+    UCI        = as.numeric(UCI)
+  ) %>%
+  select(combo_id, repetition, scenario, J, inval_frac, theta_true,
+         method, estimate, se, p, LCI, UCI) %>%
+  arrange(combo_id, repetition, method)
+
+## ------------------- Save result files -----------------
+outfile <- file.path(outdir, sprintf("mr_estimates_%03d_part%dof%d.csv", combo_id, chunk_id, n_chunks))
+write.csv(results_df, outfile, row.names = FALSE)
+message(sprintf("task_id=%d -> combo_id=%d, chunk_id=%d",
+        as.integer(Sys.getenv("SLURM_ARRAY_TASK_ID","1")),
+        combo_id, chunk_id))
