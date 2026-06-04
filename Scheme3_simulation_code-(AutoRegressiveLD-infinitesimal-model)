@@ -1,0 +1,609 @@
+if (requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+  RhpcBLASctl::blas_set_num_threads(1L)
+  RhpcBLASctl::omp_set_num_threads(1L)
+} else {
+  Sys.setenv(
+    OMP_NUM_THREADS        = "1",
+    OPENBLAS_NUM_THREADS   = "1",
+    MKL_NUM_THREADS        = "1",
+    BLIS_NUM_THREADS       = "1",
+    VECLIB_MAXIMUM_THREADS = "1"
+  )
+}
+## ------------------- Package loading ------------------
+rm(list=ls())
+library(data.table)
+library(MendelianRandomization)
+library(Matrix)
+library(MASS)
+library(parallel)
+
+outdir <- " "
+
+n_exp  <- c(400, 30000) #exposure sample size
+n_out         <- 90000  #outcome sample size
+J   <- 4000 #number of instruments
+PVE_x   <- 0.01 #exposure cis-effect 
+PVE_y   <- c(0.0, 0.01, 0.04) #to compute causal effect estimate: alpha = sqrt(PVE_y)
+PVE_GY <- c(0,0.01) #pleiotropic effect
+gamma <- c(0, 0.0005) #direct effect of SNP on outcome
+rho_values    <- c(0.125, 0.9) #AR(1) decay parameter
+tau <- c(0,10) #Directional pleiotropy shift, balanced pleiotropy (0) versus strong directional pleiotropy (10)
+
+# Parameter grid generating
+param_grid <- as.data.table(expand.grid(
+  n_exp = c(400, 30000),
+  PVE_y = c(0.0, 0.01, 0.04),
+  PVE_GY = c(0, 0.01),
+  rho = c(0.125, 0.9),
+  tau = c(0, 10),
+  KEEP.OUT.ATTRS = FALSE
+))
+param_grid[, combo_id := .I]
+
+n_sim <- 1000L
+n_core <- 25L
+n_sim_per_core <- n_sim/n_core
+
+base_seed <- 20250119L
+
+RNGkind("L'Ecuyer-CMRG")
+set.seed(base_seed)
+
+worker_streams <- vector("list", n_core)
+worker_streams[[1]] <- .Random.seed
+for (i in 2:n_core)
+  worker_streams[[i]] <- parallel::nextRNGStream(worker_streams[[i - 1]])
+
+################## Define LDA.Egger, PCA-IVW, MR-link-2 code based on the source paper/code ################################
+# --- Define LDA.Egger ---
+LDA.MREgger <- function(X, Y, W) { #X-bx; Y-by; W-
+  bX   <- cbind(1, X)                       # Design matrix: intercept and exposure effects
+  bread <- solve(crossprod(bX, W) %*% bX)   # Inverse Fisher information matrix
+  theEsts <- bread %*% crossprod(bX, W %*% Y)  # Estimated intercept and slope
+  theresid <- c(Y - theEsts[1] - X * theEsts[2])  # Residuals
+  Sig.Est <- c(crossprod(theresid, W %*% theresid)) / (length(X) - 2)  # Residual variance
+  finresults <- cbind(theEsts, diag(bread) * Sig.Est)  # Estimates and their variances
+  TestStat <- theEsts / sqrt(finresults[,2])           # t-statistics
+  Pvals <- 2 * pt(abs(TestStat), df = nrow(bX) - 2, lower.tail = FALSE)
+  cbind(finresults, TestStat, Pvals)
+}
+
+# --- Define PCA-IVW ---
+pca_ivw <- function(bx, by, byse, rho, var_threshold = 0.99) {
+  Phi <- (bx / byse) %o% (bx / byse) * rho
+  pca_obj <- prcomp(Phi, scale = FALSE)
+  K <- which(cumsum(pca_obj$sdev^2 / sum(pca_obj$sdev^2)) > var_threshold)[1]
+  bx_pc <- as.numeric(bx %*% pca_obj$rotation[, 1:K])
+  by_pc <- as.numeric(by %*% pca_obj$rotation[, 1:K])
+  Omega <- (byse %o% byse) * rho
+  pcOmega <- t(pca_obj$rotation[, 1:K]) %*% Omega %*% pca_obj$rotation[, 1:K]
+  inv_pcOmega <- tryCatch(solve(pcOmega), error = function(e) MASS::ginv(pcOmega))
+  inter <- solve(t(bx_pc) %*% inv_pcOmega %*% bx_pc)
+  beta <- inter * t(bx_pc) %*% inv_pcOmega %*% by_pc
+  se_beta <- sqrt(inter)
+  p <- 2 * pnorm(-abs(beta / se_beta))
+  data.frame(beta = beta, se_beta = se_beta, pval = p)
+}
+
+# --- Define MR-link-2 ---
+mr_link2_loglik_reference_v2 <- function(th, lam, c_x, c_y, n_x, n_y) {
+  # Convert n_x and n_y to float
+  n_x <- as.numeric(n_x)
+  n_y <- as.numeric(n_y)
+  a <- th[1]
+  tX <- abs(th[2])
+  tY <- abs(th[3])
+  
+  Dyy <- 1 / (n_y * lam + tY)
+  
+  if (a != 0) {
+    Dxx <- 1 / (exp(log(a^2 * n_y + n_x) + log(lam)) + tX -
+                  exp(log(a^2 * n_y^2 * lam^2) - log(n_y * lam + tY)))
+    Dxy <- -Dxx * a * exp(log(n_y * lam) - log(n_y * lam + tY))
+    Dyy <- Dyy + exp(log(Dxx * (a^2 * n_y^2 * lam^2)) - (2 * log(n_y * lam + tY)))
+    asq_ny_sq_lam_sq_div_ny_lam_ty <- exp(log(a^2 * n_y^2 * lam^2) - log(n_y * lam + tY))
+  } else {
+    Dxx <- 1 / (exp(log(n_x) + log(lam)) + tX)
+    Dxy <- -Dxx * a * exp(log(n_y * lam) - log(n_y * lam + tY))
+    asq_ny_sq_lam_sq_div_ny_lam_ty <- 0 * lam
+  }
+  
+  dX <- n_x * c_x + a * n_y * c_y
+  dY <- n_y * c_y
+  m <- length(c_x)
+  
+  loglik <- -m * log(2 * pi) -
+    (1 / 2) * sum(log((a^2 * n_y + n_x) * lam + tX - asq_ny_sq_lam_sq_div_ny_lam_ty)) -
+    (1 / 2) * sum(log(n_y * lam + tY)) +
+    (1 / 2) * (sum(dX^2 * Dxx) + 2 * sum(dX * dY * Dxy) + sum(dY^2 * Dyy)) -
+    (n_x / 2) * sum((c_x^2) / lam) -
+    (n_y / 2) * sum((c_y^2) / lam) +
+    (m / 2) * (log(n_x) + log(n_y)) - sum(log(lam)) + (m / 2) * (log(tX) + log(tY))
+  
+  return(-loglik)
+}
+
+mr_link2_loglik_alpha_h0 <- function(th, lam, cX, cY, nX, nY) {
+  return(mr_link2_loglik_reference_v2(c(0, th[1], th[2]), lam, cX, cY, nX, nY))
+}
+
+mr_link2_loglik_sigma_y_h0 <- function(th, lam, c_x, c_y, n_x, n_y) {
+  n_x <- as.numeric(n_x)
+  n_y <- as.numeric(n_y)
+  a <- th[1]
+  tX <- abs(th[2])
+  
+  Dyy <- rep(0, length(lam))
+  
+  if (a != 0) {
+    Dxx <- 1 / (exp(log(a^2 * n_y + n_x) + log(lam)) + tX)
+    Dxy <- rep(0, length(lam))
+    asq_ny_sq_lam_sq_div_ny_lam_ty <- rep(0, length(lam))
+  } else {
+    Dxx <- 1 / (exp(log(n_x) + log(lam)) + tX)
+    Dxy <- rep(0, length(lam))
+    asq_ny_sq_lam_sq_div_ny_lam_ty <- rep(0, length(lam))
+  }
+  
+  dX <- n_x * c_x + a * n_y * c_y
+  dY <- n_y * c_y
+  m <- length(c_x)
+  
+  loglik <- -m * log(2 * pi) -
+    (1 / 2) * sum(log((a^2 * n_y + n_x) * lam + tX - asq_ny_sq_lam_sq_div_ny_lam_ty)) +
+    (1 / 2) * (sum(dX^2 * Dxx) + 2 * sum(dX * dY * Dxy) + sum(dY^2 * Dyy)) -
+    (n_x / 2) * sum((c_x^2) / lam) -
+    (n_y / 2) * sum((c_y^2) / lam) +
+    (m / 2) * (log(n_x) + log(n_y)) - sum(log(lam)) + (m / 2) * log(tX)
+  
+  return(-loglik)
+}
+
+mr_link2 <- function(selected_eigenvalues, selected_eigenvectors,
+                     exposure_betas, outcome_betas,
+                     n_exp, n_out, sigma_exp_guess, sigma_out_guess) {
+  
+  start_time <- Sys.time()
+  
+  # Define optimization options
+  method <- "Nelder-Mead"
+  control <- list(maxit = 300)
+  
+  # Calculate c_x and c_y
+  c_x <- t(selected_eigenvectors) %*% exposure_betas
+  c_y <- t(selected_eigenvectors) %*% outcome_betas
+  
+  max_sigma <- sqrt(.Machine$double.xmax)
+  
+  # Alpha h0 estimation
+  alpha_h0_guesses <- list(c(sigma_exp_guess, sigma_out_guess),
+                           c(max_sigma, max_sigma),
+                           c(1, max_sigma),
+                           c(1e3, 1e3))
+  
+  alpha_h0_results <- optim(par = alpha_h0_guesses[[1]],
+                            fn = mr_link2_loglik_alpha_h0,
+                            gr = NULL,
+                            selected_eigenvalues, c_x, c_y, n_exp, n_out,
+                            method = method, control = control)
+  
+  # Loop over other guesses
+  for (alpha_h0_guess in alpha_h0_guesses[-1]) {
+    if (alpha_h0_results$convergence == 0) break
+    
+    new_alpha_h0_results <- optim(par = alpha_h0_guess,
+                                  fn = mr_link2_loglik_alpha_h0,
+                                  gr = NULL,
+                                  selected_eigenvalues, c_x, c_y, n_exp, n_out,
+                                  method = method, control = control)
+    
+    if (alpha_h0_results$value >= new_alpha_h0_results$value) {
+      alpha_h0_results <- new_alpha_h0_results
+    }
+  }
+  
+  # Sigma_y estimation
+  sigma_y_guesses <- list(c(0.0, sigma_exp_guess),
+                          c(1.0, sigma_exp_guess),
+                          c(0.0, alpha_h0_results$par[1]),
+                          c(1.0, alpha_h0_results$par[1]),
+                          c(0.0, max_sigma),
+                          c(1e-10, max_sigma))
+  
+  sigma_y_h0_results <- optim(par = sigma_y_guesses[[1]],
+                              fn = mr_link2_loglik_sigma_y_h0,
+                              gr = NULL,
+                              selected_eigenvalues, c_x, c_y, n_exp, n_out,
+                              method = method, control = control)
+  
+  for (sigma_y_guess in sigma_y_guesses[-1]) {
+    if (sigma_y_h0_results$convergence == 0) break
+    
+    new_sigma_y_h0_results <- optim(par = sigma_y_guess,
+                                    fn = mr_link2_loglik_sigma_y_h0,
+                                    gr = NULL,
+                                    selected_eigenvalues, c_x, c_y, n_exp, n_out,
+                                    method = method, control = control)
+    
+    if (new_sigma_y_h0_results$value < sigma_y_h0_results$value) {
+      sigma_y_h0_results <- new_sigma_y_h0_results
+    }
+  }
+  
+  # Ha estimation
+  ha_guesses <- list(c(0.0, alpha_h0_results$par[1], alpha_h0_results$par[2]),
+                     c(sigma_y_h0_results$par[1], sigma_y_h0_results$par[2], sqrt(.Machine$double.xmax)),
+                     c(1.0, alpha_h0_results$par[1], alpha_h0_results$par[2]),
+                     c(1e-10, max_sigma, max_sigma))
+  
+  ha_results <- optim(par = ha_guesses[[1]],
+                      fn = mr_link2_loglik_reference_v2,
+                      gr = NULL,
+                      selected_eigenvalues, c_x, c_y, n_exp, n_out,
+                      method = method, control = control)
+  
+  for (ha_guess in ha_guesses[-1]) {
+    if (ha_results$convergence == 0) break
+    
+    new_ha_result <- optim(par = ha_guess,
+                           fn = mr_link2_loglik_reference_v2,
+                           gr = NULL,
+                           selected_eigenvalues, c_x, c_y, n_exp, n_out,
+                           method = method, control = control)
+    
+    if (new_ha_result$value < ha_results$value) {
+      ha_results <- new_ha_result
+    }
+  }
+  
+  # Likelihood Ratio Test and Estimation
+  alpha <- ha_results$par[1]
+  alpha_chi_sq <- 2 * (alpha_h0_results$value - ha_results$value)
+  alpha_p_val <- pchisq(alpha_chi_sq, df = 1, lower.tail = FALSE)
+  z_alpha <- ifelse(alpha_chi_sq <= 0, 0.0, sign(alpha) * sqrt(alpha_chi_sq))
+  se_alpha <- ifelse(z_alpha != 0, alpha / z_alpha, NA)
+  
+  sigma_y <- 1 / abs(ha_results$par[3])
+  sigma_y_chi_sq <- 2 * (sigma_y_h0_results$value - ha_results$value)
+  sigma_y_p_val <- pchisq(sigma_y_chi_sq, df = 1, lower.tail = FALSE)
+  z_sigma_y <- ifelse(sigma_y_chi_sq <= 0, 0.0, sqrt(sigma_y_chi_sq))
+  se_sigma_y <- ifelse(z_sigma_y != 0, sigma_y / z_sigma_y, NA)
+  
+  # Return results as a list (equivalent to Python's dictionary)
+  list(
+    alpha = alpha,
+    `se(alpha)` = se_alpha,
+    `p(alpha)` = alpha_p_val,
+    sigma_y = sigma_y,
+    `se(sigma_y)` = se_sigma_y,
+    `p(sigma_y)` = sigma_y_p_val,
+    sigma_x = 1 / abs(ha_results$par[2]),
+    alpha_h0_sigma_x = 1 / abs(alpha_h0_results$par[1]),
+    alpha_h0_sigma_y = 1 / abs(alpha_h0_results$par[2]),
+    alpha_h0_loglik = alpha_h0_results$value,
+    sigma_y_h0_alpha = sigma_y_h0_results$par[1],
+    sigma_y_h0_sigma_x = 1 / abs(sigma_y_h0_results$par[2]),
+    sigma_y_h0_loglik = sigma_y_h0_results$value,
+    ha_loglik = ha_results$value,
+    optim_alpha_h0_success = alpha_h0_results$convergence == 0,
+    optim_alpha_h0_nit = alpha_h0_results$counts,
+    optim_sigma_y_h0_success = sigma_y_h0_results$convergence == 0,
+    optim_sigma_y_h0_nit = sigma_y_h0_results$counts,
+    optim_ha_success = ha_results$convergence == 0,
+    optim_ha_nit = ha_results$counts,
+    function_time = as.numeric(difftime(Sys.time(), start_time, units = "secs"))
+  )
+}
+
+remove_highly_correlated <- function(ld_matrix, snp_ordering, max_correlation) {
+  # Remove NAs from the correlation matrix
+  ld_matrix[is.na(ld_matrix)] <- 0
+  
+  # Initialize a logical vector to mark rows/columns to remove
+  idxs_to_remove <- rep(FALSE, nrow(ld_matrix))
+  
+  # Find pairs of SNPs that are highly correlated
+  correlated_indices <- which(abs(ld_matrix) >= max_correlation, arr.ind = TRUE)
+  
+  to_remove <- vector("logical", length = nrow(ld_matrix))
+  
+  # Loop through correlated pairs and mark SNPs to remove
+  for (i in seq_len(nrow(correlated_indices))) {
+    a <- correlated_indices[i, 1]
+    b <- correlated_indices[i, 2]
+    
+    if ((!to_remove[a] && !to_remove[b] ) && (a != b)) {
+      to_remove[b] <- TRUE
+    }
+  }
+  
+  # Remove highly correlated SNPs from both the matrix and the SNP list
+  ld_matrix <- ld_matrix[!to_remove, !to_remove]
+  pruned_snps <- snp_ordering[!to_remove]
+  
+  return(list(ld_matrix = ld_matrix, pruned_snps = pruned_snps))
+}
+
+mr_link2_analysis <- function(exposure_betas, outcome_betas, ld_matrix, n_exp, n_out, max_correlation = 0.99) {
+  # Prune highly correlated SNPs
+  snp_ordering <- seq_len(nrow(ld_matrix))  # Simple numbering for SNPs
+  pruned_data <- remove_highly_correlated(ld_matrix, snp_ordering, max_correlation)
+  pruned_ld_matrix <- pruned_data$ld_matrix
+  pruned_snps <- pruned_data$pruned_snps
+  
+  # Eigenvalue decomposition
+  eigen_decomp <- eigen(pruned_ld_matrix)
+  eigenvalues <- eigen_decomp$values
+  eigenvectors <- eigen_decomp$vectors
+  
+  # Calculate cumulative variance explained
+  variance_explained <- cumsum(eigenvalues) / sum(eigenvalues)
+  
+  # Select the eigenvectors that explain at least 99% of the variance
+  threshold_index <- min(which(variance_explained >= 0.99))
+  selected_eigenvectors <- eigenvectors[, 1:threshold_index]
+  selected_eigenvalues <- eigenvalues[1:threshold_index]
+  
+  # Call the existing MR-link-2 function
+  # Assuming `mr_link2` is already defined in R and takes the following arguments:
+  # - selected_eigenvalues
+  # - selected_eigenvectors
+  # - exposure_betas
+  # - outcome_betas
+  # - n_exp (number of individuals in exposure dataset)
+  # - n_out (number of individuals in outcome dataset)
+  sigma_exp_guess <- 0.01  # You can adjust or estimate this as needed
+  sigma_out_guess <- 0.001  # You can adjust or estimate this as needed
+  
+  # Subset the betas based on pruned SNPs
+  exposure_betas_pruned <- exposure_betas[pruned_snps]
+  outcome_betas_pruned <- outcome_betas[pruned_snps]
+  
+  # Perform the MR-link-2 estimation
+  mr_result <- mr_link2(
+    selected_eigenvalues = selected_eigenvalues,
+    selected_eigenvectors = selected_eigenvectors,
+    exposure_betas = exposure_betas_pruned,
+    outcome_betas = outcome_betas_pruned,
+    n_exp = n_exp,
+    n_out = n_out,
+    sigma_exp_guess = sigma_exp_guess,
+    sigma_out_guess = sigma_out_guess
+  )
+  
+  return(mr_result)
+}
+
+########### autoregressive correlation matrix generation ############
+ar1_cor <- function(n, rho) {
+  idx <- 1:n
+  rho^abs(outer(idx, idx, "-"))
+}
+
+#########################################################################
+# Function to simulate one replicate for a given parameter set
+
+simulate_summary <- function(
+    J = 4000,
+    n_exp = 400,
+    n_out = 90000,
+    PVE_x = 0.1,
+    PVE_y = 0.2,
+    PVE_GY = 0.0, 
+    tau = 0,
+    rho = 0.125
+){
+  Sigma <- ar1_cor(J, rho)
+  L <- chol(Sigma)
+  
+  # 1. Simulate raw SNP effects on QTL expression (small effects for all SNPs - infinitesimal model)
+  beta_raw <- rnorm(J)
+  
+  S <- as.numeric(t(beta_raw) %*% Sigma %*% beta_raw)
+  w <- PVE_x / S
+  beta_E <- sqrt(w) * beta_raw
+  
+  sigma_x2 <- 1 - PVE_x
+  
+  ## MR causal estimate: γ = sqrt(PVE_y)
+  gamma <- sqrt(PVE_y)
+  
+  ## Simulate true pleiotropic effect θ* = ε + τ
+  theta_star <- rnorm(J) + tau    
+  
+  ### Scale θ via σ (matrix)
+  S_theta <- as.numeric(t(theta_star) %*% Sigma %*% theta_star)
+  sigma_theta <- sqrt(PVE_GY / S_theta)
+  
+  ## θ = σ x θ*
+  theta <- sigma_theta * theta_star
+  
+  ## SNP-outcome association estimate — β_G = θ + γ β_E
+  beta_G <- theta + gamma * beta_E
+  
+  #### Observed eQTL statistics
+  var_eps_E <- (1 - PVE_x) / n_exp
+  eps_E <- L %*% rnorm(J, 0, sqrt(var_eps_E))
+  
+  beta_E_hat <- Sigma %*% beta_E + eps_E
+  se_E <- rep(sqrt(var_eps_E), J)
+  
+  #### Observed GWAS outcome statistics
+  var_eps_G <- (1 - PVE_x * gamma^2 - PVE_GY) / n_out
+  eps_G <- L %*% rnorm(J, 0, sqrt(var_eps_G))
+  
+  beta_G_hat <- Sigma %*% beta_G + eps_G
+  se_G <- rep(sqrt(var_eps_G), J)
+  
+  #### Conditional bx, by (SNP-exposure/outcome assoc estimate) for LDA-Egger
+  LD_inv = solve(Sigma)
+  
+  b_exp_cond = LD_inv %*% beta_E_hat
+  b_out_cond = LD_inv %*% beta_G_hat
+  
+  Sig_exp = LD_inv %*% (Sigma * crossprod(t(se_E))) %*% LD_inv
+  Sig_out = LD_inv %*% (Sigma * crossprod(t(se_G))) %*% LD_inv
+  
+  Sig_exp_inv = solve(Sig_exp)
+  Sig_out_inv = solve(Sig_out)
+  
+  #Return a list of results
+  list(
+    LD = Sigma,
+    beta_E = beta_E,
+    beta_G = beta_G,
+    theta = theta,
+    tau = tau,
+    gamma = gamma,
+    bx = beta_E_hat,
+    bxse = se_E,
+    by = beta_G_hat,
+    byse = se_G,
+    Zx = beta_E_hat / se_E,
+    Zy = beta_G_hat / se_G,
+    b_exp_cond = b_exp_cond,
+    b_out_cond = b_out_cond,
+    Sig_out_inv = Sig_out_inv,
+    n_exp = n_exp,
+    n_out = n_out
+  )
+}
+
+################ Extract BETA, SE, P, LCI, UCI from MR result objects ########################
+safe <- function(expr) {
+  tryCatch(expr, error = function(e) return(NA))
+}
+
+extract_result <- function(method_name, beta, se, p) {
+  if (any(is.na(c(beta, se, p)))) {
+    return(data.table(method = method_name, beta = NA, se = NA, p = NA,
+                      LCI = NA, UCI = NA))
+  }
+  LCI = beta - 1.96 * se
+  UCI = beta + 1.96 * se
+  data.table(method = method_name, beta = beta, se = se, p = p, LCI = LCI, UCI = UCI)
+}
+
+########################### MR performing engine #############################
+run_methods <- function(sim) {
+  
+  LD_mat <- sim$LD
+  bx   <- as.numeric(sim$bx)
+  bxse <- as.numeric(sim$bxse)
+  by   <- as.numeric(sim$by)
+  byse <- as.numeric(sim$byse)
+  
+  mr_obj.correl <- MendelianRandomization::mr_input(
+    bx = bx, bxse = bxse, by = by, byse = byse, corr = LD_mat)
+  
+  results <- list()
+  
+  ### 1. gIVW
+  givw <- safe(MendelianRandomization::mr_ivw(mr_obj.correl, 
+                      model = "default",
+                      correl = TRUE,
+                      distribution = "normal",
+                      alpha = 0.05))
+  results[[1]] <- extract_result("gIVW",
+                                 beta = safe(givw@Estimate),
+                                 se   = safe(givw@StdError),
+                                 p    = safe(givw@Pvalue))
+  
+  ### 2. gEgger
+  gegger <- safe(MendelianRandomization::mr_egger(mr_obj.correl, 
+                          correl = TRUE,
+                          distribution = "normal",
+                          alpha = 0.05))
+  results[[2]] <- extract_result("gEgger",
+                                 beta = safe(gegger@Estimate),
+                                 se   = safe(gegger@StdError.Est),
+                                 p    = safe(gegger@Pvalue.Est))
+  
+  ### 3. PC-GMM
+  pc_gmm <- safe(MendelianRandomization::mr_pcgmm(mr_obj.correl, 
+                          nx = sim$n_exp,
+                          ny = 90000,
+                          r = 50, thres = 0.999,
+                          robust = TRUE, alpha = 0.05))
+  results[[3]] <- extract_result("PC-GMM",
+                                 beta = safe(pc_gmm@Estimate),
+                                 se   = safe(pc_gmm@StdError),
+                                 p    = safe(pc_gmm@Pvalue))
+  
+  ### 4. LDA-Egger
+  lda_egger <- safe(LDA.MREgger(sim$b_exp_cond, sim$b_out_cond, sim$Sig_out_inv))
+  results[[4]] <- extract_result("LDA-Egger",
+                                 beta = safe(lda_egger[2,1]),
+                                 se   = safe(sqrt(lda_egger[2,2])),
+                                 p    = safe(lda_egger[2,4]))
+  
+  ### 5. PCA-IVW
+  pca_ivw <- safe(pca_ivw(bx, by, byse, LD_mat))
+  results[[5]] <- extract_result("PCA-IVW",
+                                 beta = safe(pca_ivw$beta),
+                                 se   = safe(pca_ivw$se_beta),
+                                 p    = safe(pca_ivw$pval))
+  
+  ### 6. MR-link-2
+  mr_link_2 <- safe(mr_link2_analysis(bx, by, LD_mat, sim$n_exp, 90000))
+  results[[6]] <- extract_result("MR-link-2",
+                                 beta = safe(mr_link_2$alpha),
+                                 se   = safe(mr_link_2$`se(alpha)`),
+                                 p    = safe(mr_link_2$`p(alpha)`))
+  
+  rbindlist(results)
+}
+
+###################### Looping code to generate GWAS summary statistics and run MR on generated data #################################
+combo_id <- as.integer(Sys.getenv("SLURM_ARRAY_TASK_ID", "1"))
+combo <- param_grid[combo_id]
+
+worker_results <- mclapply(seq_len(n_core), function(wid) {
+  
+  .Random.seed <- worker_streams[[wid]]
+  
+  L <- vector("list", n_sim_per_core)
+  
+  for (r in 1:n_sim_per_core) {
+    
+    .Random.seed <- parallel::nextRNGSubStream(.Random.seed)
+    
+    sim <- simulate_summary(
+      J = 4000,
+      n_exp = combo$n_exp,
+      n_out = 90000,
+      PVE_x = 0.01,
+      PVE_y = combo$PVE_y,
+      PVE_GY = combo$PVE_GY,
+      rho = combo$rho,
+      tau = combo$tau
+    )
+    
+    M <- run_methods(sim)
+    
+    M[, `:=`(
+      sim_id = (wid - 1L) * n_sim_per_core + r,
+      combo_id = combo$combo_id,
+      n_exp = combo$n_exp,
+      PVE_y = combo$PVE_y,
+      PVE_GY = combo$PVE_GY,
+      rho = combo$rho,
+      tau = combo$tau
+    )]
+    
+    L[[r]] <- M
+  }
+  
+  rbindlist(L)
+  
+}, mc.cores = n_core, mc.preschedule = TRUE)
+
+############# Compile result files #############
+
+final <- rbindlist(worker_results)
+
+suffix <- sprintf("_%03d", as.integer(combo_id))
+outfile <- file.path(outdir, sprintf("mr_corr_sims_AR_combo%s.csv", suffix))
+write.csv(final, outfile, row.names = FALSE)
+
