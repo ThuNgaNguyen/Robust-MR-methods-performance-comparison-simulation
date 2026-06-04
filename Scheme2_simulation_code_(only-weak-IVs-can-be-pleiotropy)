@@ -1,0 +1,367 @@
+# ======= Reproducible single-thread math (avoid hidden parallel RNG) =======
+if (requireNamespace("RhpcBLASctl", quietly = TRUE)) {
+  RhpcBLASctl::blas_set_num_threads(1L)
+  RhpcBLASctl::omp_set_num_threads(1L)
+} else {
+  Sys.setenv(
+    OMP_NUM_THREADS        = "1",
+    OPENBLAS_NUM_THREADS   = "1",
+    MKL_NUM_THREADS        = "1",
+    BLIS_NUM_THREADS       = "1",
+    VECLIB_MAXIMUM_THREADS = "1",
+    R_MAX_NUM_DLLS         = "200"
+  )
+}
+## ------------------- Package loading ------------------
+rm(list = ls())
+
+library(MendelianRandomization)
+library(dplyr)
+library(ggplot2)
+library(mr.raps)
+library(parallel)
+library(tibble)
+
+outdir <- " "
+## ------------------- Local setup --------------------
+base_seed <- 20251102L             
+nsim  <- 2000L                       
+n_cpus <- as.integer(Sys.getenv("SLURM_CPUS_PER_TASK", "8"))
+
+Nx <- 400L #approx sample size of retinal eQTL GWAS
+Ny <- 90000L #approx sample size of RE GWAS
+MAF <- 0.30
+vg <- 2*MAF*(1-MAF)
+
+theta_grid   <- c(0, 0.2) #MR causal effect estimate
+variant_grid <- c(10L, 30L) #number of IVs
+invalid_frac <- c(0.2, 0.4) #percent of IVs with pleiotropy
+IV_structure_grid <- c("case1", "case2", "case3") 
+#case1:10%IV strong (Fstat=25), 90% null (Fstat=0); case2:10%strong,90%weak (Fstat=5); case3: all weak
+
+# Construct combo_id table
+design_s1 <- expand.grid(
+  scenario     = 1L,
+  inval_frac   = 0,               # no pleiotropy in scenario 1
+  J            = variant_grid,
+  theta        = theta_grid,
+  iv_structure = IV_structure_grid,
+  KEEP.OUT.ATTRS = FALSE
+)
+
+design_s23 <- expand.grid(
+  scenario     = 2:3,             # balanced/directional, InSIDE satisfied
+  inval_frac   = invalid_frac,     
+  J            = variant_grid,
+  theta        = theta_grid,
+  iv_structure = IV_structure_grid,
+  KEEP.OUT.ATTRS = FALSE
+)
+
+design <- dplyr::bind_rows(design_s1, design_s23)
+design$combo_id <- seq_len(nrow(design))
+
+## ---- Helper functions (IV-exposure association estimate vector assigning) ----
+build_gamma_vec <- function(J, iv_structure, prop_strong = 0.10) {
+  gamma <- rep(0, J) #true genetic effect of SNP on exposure
+  strength <- rep("null", J)
+  
+  m <- max(1L, round(prop_strong * J)) #n strong IVs
+  
+  if (iv_structure == "case1") {
+    strong_idx <- sample.int(J, m)
+    strength[strong_idx] <- "strong"
+    gamma[strong_idx] <- rnorm(m, 0.06, 0.01)
+    
+  } else if (iv_structure == "case2") {
+    strong_idx <- sample.int(J, m)
+    strength[strong_idx] <- "strong"
+    strength[-strong_idx] <- "weak"
+    gamma[strong_idx] <- rnorm(m, 0.06, 0.01)
+    gamma[-strong_idx] <- rnorm(J - m, 0, 0.02)
+    
+  } else if (iv_structure == "case3") {
+    strength[] <- "weak"
+    gamma[] <- rnorm(J, 0, 0.02)
+    strong_idx <- integer(0)
+    
+  } else stop("Unknown iv_structure")
+  
+  list(gamma = gamma, strength = strength,
+     strong_idx = which(strength == "strong"))
+}
+
+## ---- Helper functions (directly generate 2 GWAS summary statistics of exposure and outcome) ----
+generate_2_sumstats <- function(J, theta, 
+                                scenario, # 1=no pleio, 2=balanced, 3=directional (InSIDE satisfied)
+                                iv_structure, 
+                                Ny = 90000L, maf = 0.3, Nx = 400L,
+                                inval_frac = 0.2) {
+  
+  #Xx <- gamma*Gx + U + eX, Xx - exposure in exposure sample
+  #Xy <- gamma*Gy + U + eX, Xy - exposure in outcome sample 
+  #Yy <- theta*Xy + alpha*Gy + U + eY, Y - outcome in outcome sample (theta: causal effect estimate, alpha: pleiotropy effect)
+  
+  #Drawing true SNP-exposure assoc estimate for null, weak, strong IV
+  gamma_vec <- build_gamma_vec(J, iv_structure)
+  gamma     <- gamma_vec$gamma
+  strength <- factor(gamma_vec$strength, levels = c("null","weak","strong"))
+  strong_idx <- gamma_vec$strong_idx
+  weak_idx <- which(strength != "strong")
+  
+  ###Pleiotropy scenario assigning
+  J_invalid <- if (scenario == 1L) 0L else floor(inval_frac * length(weak_idx))
+  invalid_idx <- if (J_invalid > 0) sample(weak_idx, J_invalid, replace = FALSE) else integer(0) #only weak IV can be pleiotropic
+  alpha <- rep(0, J)
+  if (scenario == 2L && J_invalid > 0) alpha[invalid_idx] <- rnorm(J_invalid, 0, 0.02) #balanced
+  if (scenario == 3L && J_invalid > 0) alpha[invalid_idx] <- runif(J_invalid, 0, 0.02) #directional
+  
+  #random error variance
+  varU <- 1
+  varEX <- 1
+  varEY <- 1
+  
+  ## Calculate population-level var(X), var(Y), var(G)
+  varG <- 2*maf*(1-maf)
+  varX <- sum(gamma^2 * varG) + varU + varEX   
+  varY <- theta^2 * varX + sum(alpha^2 * varG) + varU + varEY
+  
+  #Calculate outcome-SNP association estimate
+  gamma_out <- theta*gamma + alpha
+  
+  #Calculate sigma_gamma and sigma_outcome_SNP_assoc (SE of regression coefficients of SNP-exposure/outcome association)
+  sigma2gamma <- (varX - gamma^2*varG)/(Nx*varG)
+  sigma2out <- (varY - gamma_out^2 * varG)/(Ny * varG)
+  
+  #Simulate observed genetic association between exp, out and SNP
+  gamma_hat_X <- rnorm(J, gamma, sqrt(sigma2gamma))
+  gamma_hat_Y <- rnorm(J, gamma_out, sqrt(sigma2out ))
+  
+  #Check Fstat of IV
+  Fj_emp <- (gamma_hat_X ^2) / sigma2gamma
+  
+  strength_by_Fstat <- ifelse(Fj_emp < 10, "weak", "strong")
+  strength_by_Fstat <- factor(strength_by_Fstat, levels = c("weak","strong"))
+  
+  IV_strength_check <- ifelse(
+    strength == "strong",
+    strength_by_Fstat == "strong",
+    strength_by_Fstat == "weak"
+  )
+  
+  ## ---------------- Output ---------------- 
+  tibble::tibble(
+    SNP   = paste0("SNP", seq_len(J)),
+    bx    = gamma_hat_X, bxse = sqrt(sigma2gamma),
+    by    = gamma_hat_Y, byse = sqrt(sigma2out),
+    gamma_true = gamma,
+    alpha_true = alpha,
+    Fj_emp     = Fj_emp,
+    strength_true   = strength,
+    strength_by_Fstat = strength_by_Fstat,
+    IV_strength_check = IV_strength_check,
+    scenario   = scenario,
+    theta      = theta,
+    Nx = Nx, Ny = Ny,
+    iv_structure = iv_structure,
+    J = J
+  )
+}
+
+## ---- MR estimation engine ----
+run_mr_suite_7 <- function(df, Nx, Ny) {
+  out <- list()
+  MR_obj <- MendelianRandomization::mr_input(
+    bx   = df$bx, bxse = df$bxse,
+    by   = df$by, byse = df$byse,
+    snps = df$SNP
+  )
+  
+  safe <- function(expr, name) {
+    tryCatch({
+      out[[name]] <<- eval(expr)
+      NULL
+    }, error = function(e) {
+      out[[name]] <<- structure(list(error = conditionMessage(e)), class = "mr_error")
+      NULL
+    })
+  }
+  
+  safe(quote(MendelianRandomization::mr_ivw(
+    MR_obj, robust = FALSE, distribution = "normal",
+    penalized = FALSE, alpha = 0.05, correl = FALSE)), "IVW")
+  
+  safe(quote(MendelianRandomization::mr_egger(MR_obj, robust = FALSE, distribution = "normal",
+                                              penalized = FALSE, alpha = 0.05, correl = FALSE)), "Egger")
+  
+  safe(quote(MendelianRandomization::mr_median(MR_obj, distribution = "normal",
+                                               weighting = "weighted", alpha = 0.05)), "WMEDIAN")
+  
+  safe(quote(MendelianRandomization::mr_mbe(MR_obj, distribution = "normal",
+                                            weighting = "weighted", stderror = "simple",
+                                            phi = 1, alpha = 0.05)), "MBE_w")
+  
+  safe(quote(MendelianRandomization::mr_divw(
+    MR_obj, over.dispersion = TRUE, alpha = 0.05, diagnostics = FALSE
+  )), "dIVW")
+  
+  safe(quote(MendelianRandomization::mr_pivw(
+    MR_obj, over.dispersion = TRUE, delta = 0, sel.pval = NULL,
+    alpha = 0.05, Boot.Fieller = TRUE
+  )), "pIVW")
+  
+  df_raps <- data.frame(
+    beta.exposure = df$bx,
+    beta.outcome  = df$by,
+    se.exposure   = df$bxse,
+    se.outcome    = df$byse
+  )
+  
+  safe(quote(mr.raps::mr.raps(
+    df_raps,
+    over.dispersion = TRUE,
+    loss.function   = "huber",
+    diagnostics     = TRUE
+  )), "mr.raps")
+  
+  out
+}
+
+## ---- Tidy extraction to extract MR statistics ----
+.get_field <- function(obj, candidates) {
+  if (isS4(obj)) {
+    sn <- slotNames(obj)
+    for (nm in candidates) if (nm %in% sn) {
+      val <- tryCatch(slot(obj, nm), error = function(e) NULL)
+      if (!is.null(val)) return(suppressWarnings(as.numeric(val[1L])))
+    }
+  }
+  if (!is.list(obj)) return(NA_real_)
+  nn <- names(obj)
+  for (nm in candidates) {
+    if (!is.null(nn) && nm %in% nn) {
+      val <- obj[[nm]]
+      if (is.list(val) && length(val) >= 1L) val <- val[[1L]]
+      return(suppressWarnings(as.numeric(val[1L])))
+    }
+  }
+  NA_real_
+}
+
+.derive_se_from_ci <- function(LCI, UCI, level = 0.95) {
+  if (is.finite(LCI) && is.finite(UCI)) {
+    z <- qnorm(1 - (1 - level)/2)
+    (UCI - LCI) / (2 * z)
+  } else NA_real_
+}
+
+## ------------------- Extract BETA, SE, P, 95% CIs in results objects ----
+tidy_one <- function(method_name, obj) {
+  if (inherits(obj, "mr_error")) {
+    return(data.frame(
+      method = method_name,
+      estimate = NA_real_,
+      se = NA_real_,
+      p = NA_real_,
+      LCI = NA_real_,
+      UCI = NA_real_,
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  as_row <- function(est = NA_real_, se = NA_real_, p = NA_real_,
+                     LCI = NA_real_, UCI = NA_real_) {
+    data.frame(method = method_name, estimate = est, se = se, p = p,
+               LCI = LCI, UCI = UCI, stringsAsFactors = FALSE)
+  }
+  
+  est <- .get_field(obj, c("Estimate", "beta.hat", "CausalEstimate"))
+  p   <- .get_field(obj, c("Pvalue","P_value","p-value", "Causal_p","Pvalue.Est"))
+  LCI <- .get_field(obj, c("CILower", "CILower.Est"))
+  UCI <- .get_field(obj, c("CIUpper", "CIUpper.Est"))
+  se  <- .get_field(obj, c("StdError","beta.se", "StdError.Est","SdCausalEstimate","se_beta"))
+  
+  if (!is.finite(se) && (is.finite(LCI) || is.finite(UCI)))
+    se <- .derive_se_from_ci(LCI, UCI)
+  
+  if ((!is.finite(LCI) || !is.finite(UCI)) && is.finite(est) && is.finite(se)) {
+    LCI <- est - 1.96 * se
+    UCI <- est + 1.96 * se
+  }
+  
+  if (!is.finite(p) && is.finite(est) && is.finite(se) && se > 0) {
+    p <- 2 * pnorm(abs(est / se), lower.tail = FALSE)
+  }
+  
+  as_row(est, se, p, LCI, UCI)
+}
+
+## ---- Run one example design locally ----
+## ---- Run ALL design combos (one CSV result file per combo) ----
+options(mc.cores = 1L)
+dir.create(outdir, showWarnings = FALSE, recursive = TRUE)
+
+task_id <- as.integer(Sys.getenv("SLURM_ARRAY_TASK_ID", "1"))
+stopifnot(task_id >= 1L, task_id <= nrow(design))
+combo_id <- design$combo_id[task_id]
+di <- design[design$combo_id == combo_id, , drop = FALSE]
+di <- di[1, ]
+  
+  # Reproducible seed per DGM cell
+  RNGkind("L'Ecuyer-CMRG")
+  set.seed(base_seed + combo_id)
+  
+  # Independent worker streams for this combo
+  worker_streams <- vector("list", n_cpus)
+  worker_streams[[1]] <- .Random.seed
+  for (i in 2:n_cpus) worker_streams[[i]] <- parallel::nextRNGStream(worker_streams[[i - 1]])
+  
+  # Split nsim across workers (allow remainder)
+  reps_base  <- nsim %/% n_cpus
+  reps_extra <- nsim %%  n_cpus
+  
+  worker_results <- mclapply(seq_len(n_cpus), function(worker_id) {
+    
+    .Random.seed <- worker_streams[[worker_id]]
+    reps <- reps_base + as.integer(worker_id <= reps_extra)
+    results_list <- vector("list", reps)
+
+    worker_offset <- (worker_id - 1L) * reps_base + pmin(worker_id - 1L, reps_extra)
+    
+    for (r in seq_len(reps)) {
+      .Random.seed <- parallel::nextRNGSubStream(.Random.seed)
+      
+      df <- generate_2_sumstats(
+        J = di$J, theta = di$theta, scenario = di$scenario,
+        iv_structure = di$iv_structure,
+        Nx = Nx, Ny = Ny, maf = MAF, inval_frac = di$inval_frac
+      )
+      
+      mr_list  <- run_mr_suite_7(df, Nx = Nx, Ny = Ny)
+
+      est_rows <- do.call(rbind, Map(tidy_one, names(mr_list), mr_list))
+      est_rows$scenario     <- di$scenario
+      est_rows$J            <- di$J
+      est_rows$theta_true   <- di$theta
+      est_rows$iv_structure <- di$iv_structure
+      est_rows$inval_frac   <- di$inval_frac
+      est_rows$IV_strength_misclass_rate <- mean(!df$IV_strength_check)
+      est_rows$prop_strong_true <- mean(df$strength_true == "strong")
+      est_rows$prop_strong_emp  <- mean(df$strength_by_Fstat == "strong")
+      est_rows$combo_id     <- combo_id
+      est_rows$repetition   <-  worker_offset + r
+      
+      results_list[[r]] <- est_rows
+    }
+    
+    res <- dplyr::bind_rows(results_list)
+  }, mc.cores = n_cpus)
+    
+  results_df <- dplyr::bind_rows(worker_results)
+  
+  outfile <- file.path(
+    outdir,
+    sprintf("mr_estimates_small_gamma_N400_pleiotropy_only_weak_IVs_combo%02d.csv", combo_id)
+  )
+  
+  write.csv(results_df, outfile, row.names = FALSE)
