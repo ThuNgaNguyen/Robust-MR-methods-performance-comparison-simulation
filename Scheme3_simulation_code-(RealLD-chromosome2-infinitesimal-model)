@@ -391,29 +391,29 @@ simulate_summary <- function(
   L <- chol(Sigma)
   
   # 1. Simulate raw SNP effects on expression (small effects for all SNPs - infinitesimal model)
-  beta_raw <- rnorm(J)
+  gamma_raw <- rnorm(J)
   
-  S <- as.numeric(t(beta_raw) %*% Sigma %*% beta_raw)
+  S <- as.numeric(t(gamma_raw) %*% Sigma %*% gamma_raw)
   w <- PVE_x / S
-  beta_E <- sqrt(w) * beta_raw
+  gamma_E <- sqrt(w) * gamma_raw
   
   sigma_x2 <- 1 - PVE_x
   
   ## MR causal estimate: γ = sqrt(PVE_y)
-  gamma <- sqrt(PVE_y)
+  theta <- sqrt(PVE_y)
   
-  ## Simulate true pleiotropic effect θ* = ε + τ
-  theta_star <- rnorm(J) + tau    # <-- τ added here
+  ## Simulate true pleiotropic effect alpha* = ε + τ
+  alpha_star <- rnorm(J) + tau    # <-- τ added here
   
   ### Scale θ via σ
-  S_theta <- as.numeric(t(theta_star) %*% Sigma %*% theta_star)
-  sigma_theta <- sqrt(PVE_GY / S_theta)
+  S_alpha <- as.numeric(t(alpha_star) %*% Sigma %*% alpha_star)
+  sigma_alpha <- sqrt(PVE_GY / S_alpha)
   
-  ## θ = σ θ*
-  theta <- sigma_theta * theta_star
+  ## alpha = σ alpha*
+  alpha <- sigma_alpha * alpha_star
   
-  ## SNP-outcome association estimate — β_G = θ + γ β_E
-  beta_G <- theta + gamma * beta_E
+  ## SNP-outcome association estimate — β_GY = alpha + θ.β_E
+  beta_GY <- alpha + theta * beta_E
   
   #### Observed eQTL statistics
   var_eps_E <- (1 - PVE_x) / n_exp
@@ -423,7 +423,7 @@ simulate_summary <- function(
   se_E <- rep(sqrt(var_eps_E), J)
   
   #### Observed GWAS outcome statistics
-  var_eps_G <- (1 - PVE_x * gamma^2 - PVE_GY) / n_out
+  var_eps_G <- (1 - PVE_x * theta^2 - PVE_GY) / n_out
   eps_G <- L %*% rnorm(J, 0, sqrt(var_eps_G))
   
   beta_G_hat <- Sigma %*% beta_G + eps_G
